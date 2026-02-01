@@ -1,28 +1,158 @@
 import time
 import os
+import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.metrics import accuracy_score, confusion_matrix, recall_score, precision_score
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 import matplotlib
-matplotlib.use('Agg')
+
+# Thiết lập chế độ vẽ biểu đồ không giao diện (dành cho server/console)
+matplotlib.use('Agg') 
+plt.rcParams["font.family"] = "serif" # Font chuẩn cho các tạp chí khoa học quốc tế
+
+# Import các module nội bộ
 import config, data_loader, fitness_wrapper, pa5_runner, fs_mapping
 
-def calculate_jaccard(mask_a, mask_b):
-    """Tính chỉ số Jaccard giữa hai tập gene (mask)"""
-    set_a = set(np.where(mask_a == 1)[0])
-    set_b = set(np.where(mask_b == 1)[0])
-    intersection = len(set_a.intersection(set_b))
-    union = len(set_a.union(set_b))
-    return intersection / union if union > 0 else 0
+# --- CLASS GHI LOG AN TOÀN (FIX LỖI I/O) ---
+class DualLogger(object):
+    def __init__(self, filepath):
+        self.terminal = sys.stdout
+        # Mở file log với mã hóa utf-8
+        self.log = open(filepath, "w", encoding='utf-8')
 
-def run_experiment(data_name, task_cfg):
-    print(f"\n{'='*45}\n TIẾN TRÌNH: {data_name} (R = {config.R_RUNS})\n{'='*45}")
+    def write(self, message):
+        # Luôn ghi ra màn hình terminal
+        self.terminal.write(message)
+        # Chỉ ghi vào file nếu file vẫn đang mở
+        if self.log and not self.log.closed:
+            try:
+                self.log.write(message)
+            except ValueError:
+                pass # Tránh lỗi I/O khi hệ thống đóng file bất ngờ
+
+    def flush(self):
+        # Đảm bảo luồng dữ liệu được đẩy đi
+        self.terminal.flush()
+        if self.log and not self.log.closed:
+            try:
+                self.log.flush()
+            except ValueError:
+                pass
+        
+    def close(self):
+        """Đóng file log một cách an toàn"""
+        if self.log:
+            try:
+                self.log.flush()
+                self.log.close()
+            except ValueError:
+                pass
+            self.log = None
+
+# --- CÁC HÀM HỖ TRỢ VẼ BIỂU ĐỒ CHUYÊN NGHIỆP ---
+
+def plot_combined_charts(results_store, data_name, res_dir):
+    """Vẽ biểu đồ hội tụ và so sánh hiệu suất chuẩn Academic (DPI 300)"""
+    print(f"\n[PLOT] Generating professional charts for {data_name}...")
     
-    # 1. LOAD DATA
+    # Định nghĩa màu sắc và kiểu đường vẽ cố định
+    colors = {config.ALGO_NAME: '#D62728', 'GA': '#1F77B4', 'PSO': '#2CA02C'}
+    styles = {config.ALGO_NAME: '-', 'GA': '--', 'PSO': '-.'}
+    algos = list(results_store.keys())
+
+    # --- 1. Convergence Characteristics ---
+    plt.figure(figsize=(8, 5))
+    has_history = False
+    for algo, data in results_store.items():
+        if algo != 'Baseline' and 'history' in data and data['history']:
+            plt.plot(data['history'], label=algo, color=colors.get(algo, 'black'), 
+                     linestyle=styles.get(algo, '-'), linewidth=1.8)
+            has_history = True
+            
+    if has_history:
+        plt.title(f'Convergence Characteristics: {data_name} Dataset', fontsize=12, fontweight='bold')
+        plt.xlabel('Number of Iterations', fontsize=11)
+        plt.ylabel('Objective Function Value (Fitness)', fontsize=11)
+        plt.legend(loc='upper right', frameon=True)
+        plt.grid(True, linestyle=':', alpha=0.6)
+        plt.tight_layout()
+        plt.savefig(os.path.join(res_dir, 'FIG_Convergence_Analysis.png'), dpi=300)
+        plt.close()
+    
+    # --- 2. Accuracy Comparison (Mean ± STD) ---
+    plt.figure(figsize=(8, 5))
+    acc_means = []
+    acc_stds = [] 
+    plot_algos = []
+    
+    for a in algos:
+        plot_algos.append(a)
+        if 'stats_mean' in results_store[a]:
+            acc_means.append(results_store[a]['stats_mean']['Accuracy'])
+            acc_stds.append(results_store[a]['stats_std']['Accuracy'])
+        else:
+            acc_means.append(results_store[a]['acc']) # Baseline
+            acc_stds.append(0)
+
+    bar_colors = ['#7F7F7F' if a == 'Baseline' else colors.get(a, '#FF7F0E') for a in plot_algos]
+    
+    bars = plt.bar(plot_algos, acc_means, yerr=acc_stds, capsize=6, color=bar_colors, alpha=0.85, width=0.6)
+    plt.ylim(0, 1.15)
+    plt.title(f'Classification Performance Comparison ({config.R_RUNS} runs)', fontsize=12, fontweight='bold')
+    plt.ylabel('Mean Accuracy (%)', fontsize=11)
+    
+    for bar in bars:
+        yval = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, yval + 0.02, f'{yval*100:.2f}%', ha='center', fontweight='bold')
+        
+    plt.tight_layout()
+    plt.savefig(os.path.join(res_dir, 'FIG_Accuracy_Comparison.png'), dpi=300)
+    plt.close()
+
+def plot_combined_confusion_matrices(results_store, data_name, res_dir, class_names):
+    """Vẽ gộp các Confusion Matrices trên cùng một hàng"""
+    algos = [k for k in results_store.keys()]
+    n = len(algos)
+    if n == 0: return
+
+    print(f"[PLOT] Generating Combined Confusion Matrices...")
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
+    if n == 1: axes = [axes]
+
+    for i, algo in enumerate(algos):
+        cm = results_store[algo].get('cm')
+        ax = axes[i]
+        
+        if cm is not None:
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
+                        xticklabels=class_names, yticklabels=class_names, ax=ax)
+            acc_val = results_store[algo]['acc'] * 100
+            ax.set_title(f"{algo}\n(Best Acc: {acc_val:.1f}%)", fontweight='bold')
+            ax.set_xlabel('Predicted Class')
+            if i == 0: ax.set_ylabel('Actual Class')
+            else: ax.set_ylabel('')
+        else:
+            ax.text(0.5, 0.5, "No Data", ha='center', va='center')
+
+    plt.suptitle(f"Confusion Matrix Comparison - {data_name}", fontsize=14, fontweight='bold')
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(os.path.join(res_dir, 'FIG_Combined_Confusion_Matrices.png'), dpi=300)
+    plt.close()
+
+# --- HÀM THỰC THI (CORE LOGIC) ---
+def run_experiment(data_name, task_cfg, algo_type=config.ALGO_NAME):
+    """Thực thi một vòng thí nghiệm cho thuật toán được chỉ định"""
+    if 'k_max' in task_cfg: config.K_MAX = task_cfg['k_max']
+    
+    print(f"\n{'-'*65}")
+    print(f"Algorithm: {algo_type} | Dataset: {data_name}")
+    print(f"{'-'*65}")
+
+    # 1. Tải dữ liệu
     if task_cfg.get('is_split'):
         X_train, y_train, gene_names = data_loader.load_dataset(task_cfg['train_path'])
         X_test, y_test, _ = data_loader.load_dataset(task_cfg['test_path'])
@@ -31,157 +161,139 @@ def run_experiment(data_name, task_cfg):
         X_train, X_test, y_train, y_test = train_test_split(
             X_all, y_all, test_size=config.TEST_SIZE, stratify=y_all, random_state=42
         )
-
-    res_dir = os.path.join(config.BASE_DIR, "results", data_name)
-    os.makedirs(res_dir, exist_ok=True)
+    
+    class_names = data_loader.label_encoder.classes_
     rf_params = config.RF_PARAMS.copy()
-    rf_params['random_state'] = 42
 
-    # 2. ĐÁNH GIÁ BASELINE (BỘ DỮ LIỆU GỐC)
-    print(f"[*] Đang thực thi RF trên bộ dữ liệu gốc...")
-    rf_full = RandomForestClassifier(**rf_params)
-    
-    start_full = time.time()
-    rf_full.fit(X_train, y_train)
-    y_pred_full = rf_full.predict(X_test)
-    time_exec_full = time.time() - start_full # Thời gian thực thi bộ gốc
-    
-    acc_full = accuracy_score(y_test, y_pred_full)
+    # 2. Đánh giá Baseline (Sử dụng toàn bộ đặc trưng ban đầu)
+    if algo_type == "Baseline":
+        rf_full = RandomForestClassifier(**rf_params)
+        rf_full.fit(X_train, y_train)
+        y_pred_full = rf_full.predict(X_test)
+        acc_full = accuracy_score(y_test, y_pred_full)
+        print(f"    + Baseline Accuracy: {acc_full*100:.2f}%")
+        return {
+            "acc": acc_full, "history": [], "genes_count": X_train.shape[1], 
+            "cm": confusion_matrix(y_test, y_pred_full)
+        }, class_names
 
-    # 3. TỐI ƯU HÓA PA-5 QUA R LẦN CHẠY
+    # 3. Vòng lặp tối ưu hóa và đánh giá thống kê
     all_best_masks = []
-    all_opt_durations = []
-    final_best_z = None
-    final_best_fit = np.inf
+    run_stats = [] 
+    final_best_z, final_best_fit = None, np.inf
     final_history = []
-
+    
     for r in range(config.R_RUNS):
         start_opt = time.time()
-        # Chạy thuật toán PA-5
-        current_z, current_fit, history = pa5_runner.run_pa5(
-            X_train, y_train, 
-            fitness_wrapper.fitness_feature_selection,
-            reference_masks=all_best_masks
-        )
-        all_opt_durations.append(time.time() - start_opt)
         
-        m = fs_mapping.binarize_solution(current_z, config.THRESHOLD, k_max=config.K_MAX)
+        # Gọi các thuật toán tối ưu từ pa5_runner
+        if algo_type == config.ALGO_NAME:
+            curr_z, curr_fit, hist = pa5_runner.run_rbmo_sboa(X_train, y_train, fitness_wrapper.fitness_feature_selection, reference_masks=all_best_masks)
+        elif algo_type == "GA":
+            curr_z, curr_fit, hist = pa5_runner.run_ga(X_train, y_train, fitness_wrapper.fitness_feature_selection, reference_masks=all_best_masks)
+        elif algo_type == "PSO":
+            curr_z, curr_fit, hist = pa5_runner.run_pso(X_train, y_train, fitness_wrapper.fitness_feature_selection, reference_masks=all_best_masks)
+        
+        duration = time.time() - start_opt
+        
+        # Ánh xạ nghiệm sang tập gen được chọn
+        m = fs_mapping.binarize_solution(curr_z, config.THRESHOLD, k_max=config.K_MAX)
         all_best_masks.append(m)
         
-        if current_fit < final_best_fit:
-            final_best_fit = current_fit
-            final_best_z = current_z
-            final_history = history
+        sel_idx_run = np.where(m == 1)[0]
+        if len(sel_idx_run) > 0:
+            rf_run = RandomForestClassifier(**rf_params)
+            rf_run.fit(X_train[:, sel_idx_run], y_train)
+            y_pred_run = rf_run.predict(X_test[:, sel_idx_run])
+            acc_run = accuracy_score(y_test, y_pred_run)
+            sens_run = recall_score(y_test, y_pred_run, average='macro', zero_division=0)
+            spec_run = precision_score(y_test, y_pred_run, average='macro', zero_division=0)
+        else:
+            acc_run, sens_run, spec_run = 0, 0, 0
 
-    # 4. TÍNH ĐỘ ỔN ĐỊNH (STAB) THEO CÔNG THỨC TRONG ẢNH
-    # Stab = [1 / (R-1)] * Tổng J(S_r, S_r-1)
-    if len(all_best_masks) > 1:
-        jaccard_sums = 0
-        for r in range(1, len(all_best_masks)):
-            jaccard_sums += calculate_jaccard(all_best_masks[r], all_best_masks[r-1])
-        stab_score = jaccard_sums / (len(all_best_masks) - 1)
-    else:
-        stab_score = 1.0
+        run_stats.append({
+            'Accuracy': acc_run, 'Sensitivity': sens_run, 'Specificity': spec_run,
+            'Selected_Genes': len(sel_idx_run), 'Fitness': curr_fit, 'Time(s)': duration
+        })
 
-    # 5. ĐÁNH GIÁ BỘ DATA ĐÃ CHỌN LỌC (LẦN CUỐI CÙNG)
+        if curr_fit < final_best_fit:
+            final_best_fit, final_best_z, final_history = curr_fit, curr_z, hist
+        
+        print(f"    -> Run {r+1}/{config.R_RUNS} | Fit: {curr_fit:.4f} | Acc: {acc_run*100:.2f}%")
+
+    # 4. Tính toán số liệu thống kê Mean/STD
+    df_stats = pd.DataFrame(run_stats)
+    stats_mean = df_stats.mean()
+    stats_std = df_stats.std()
+    
+    # 5. Lấy kết quả tốt nhất để vẽ Confusion Matrix
     _, fit_details = fitness_wrapper.fitness_feature_selection(final_best_z, X_train, y_train, config)
     sel_idx = np.where(fit_details['mask'] == 1)[0]
-    selected_genes = gene_names[sel_idx]
-
-    print(f"[*] Đang thực thi RF trên bộ dữ liệu chọn lọc (PA-5)...")
+    
     rf_opt = RandomForestClassifier(**rf_params)
-    
-    start_opt_final = time.time()
     rf_opt.fit(X_train[:, sel_idx], y_train)
-    y_pred_opt = rf_opt.predict(X_test[:, sel_idx])
-    time_exec_opt = time.time() - start_opt_final # Thời gian thực thi bộ rút gọn
+    y_pred = rf_opt.predict(X_test[:, sel_idx])
     
-    acc_opt = accuracy_score(y_test, y_pred_opt)
+    # Lưu báo cáo thống kê cho từng thuật toán
+    res_dir = os.path.join(config.BASE_DIR, "results", data_name)
+    df_stats.to_csv(os.path.join(res_dir, f'{algo_type}_statistical_report.csv'), index=False)
 
-    # 6. XUẤT HỒ SƠ KẾT QUẢ (Khớp chính xác image_9b8c55.png)
-    # A. final_performance_report.csv
-    pd.DataFrame({
-        'Metric': ['Real Test Accuracy', 'Match Count', 'Total Fitness', 'Error Rate', 
-                   'Reduction Rate', 'Stability (Stab)', 'Selected Genes', 'Execution Time (s)'],
-        'Value': [f"{acc_opt*100:.2f}%", f"{np.sum(y_pred_opt==y_test)}/{len(y_test)}", 
-                  f"{final_best_fit:.6f}", f"{fit_details['error_rate']:.6f}", 
-                  f"{fit_details['reduction_rate']:.6f}", f"{stab_score:.6f}", 
-                  len(sel_idx), f"{np.sum(all_opt_durations):.2f}"]
-    }).to_csv(os.path.join(res_dir, 'final_performance_report.csv'), index=False, encoding='utf-8-sig')
+    return {
+        "acc": accuracy_score(y_test, y_pred),
+        "stats_mean": stats_mean, 
+        "stats_std": stats_std,
+        "history": final_history,
+        "genes_count": len(sel_idx),
+        "cm": confusion_matrix(y_test, y_pred)
+    }, class_names
 
-    # B. comparison_report.csv
-    pd.DataFrame({
-        'Thông số': ['Accuracy', 'Số lượng Gene', 'Thời gian thực thi RF (s)'],
-        'Dữ liệu Gốc': [f"{acc_full*100:.2f}%", X_train.shape[1], f"{time_exec_full:.4f}"],
-        'PA-5 Tối ưu': [f"{acc_opt*100:.2f}%", len(sel_idx), f"{time_exec_opt:.4f}"]
-    }).to_csv(os.path.join(res_dir, 'comparison_report.csv'), index=False, encoding='utf-8-sig')
-
-    # C. selected_genes_list.csv
-    pd.DataFrame({'STT': range(1, len(selected_genes) + 1), 'Gene_Name': selected_genes}).to_csv(os.path.join(res_dir, 'selected_genes_list.csv'), index=False, encoding='utf-8-sig')
-
-    # D. detailed_predictions.csv & detailed_predictions_pa5.csv
-    y_test_named = data_loader.label_encoder.inverse_transform(y_test)
-    pd.DataFrame({'Actual': y_test_named, 'Predicted': data_loader.label_encoder.inverse_transform(y_pred_full), 'Verdict': ['Correct' if a==p else 'Wrong' for a,p in zip(y_test, y_pred_full)]}).to_csv(os.path.join(res_dir, 'detailed_predictions.csv'), index=False, encoding='utf-8-sig')
-    pd.DataFrame({'Actual': y_test_named, 'Predicted': data_loader.label_encoder.inverse_transform(y_pred_opt), 'Verdict': ['Correct' if a==p else 'Wrong' for a,p in zip(y_test, y_pred_opt)]}).to_csv(os.path.join(res_dir, 'detailed_predictions_pa5.csv'), index=False, encoding='utf-8-sig')
-
-    # 7. VẼ BIỂU ĐỒ
-    # --- Confusion Matrix ---
-    plt.figure(figsize=(8,6))
-    plt.clf() # Xóa trắng figure hiện tại
-    sns.heatmap(confusion_matrix(y_test, y_pred_opt), annot=True, fmt='d', cmap='Blues', 
-                xticklabels=data_loader.label_encoder.classes_, 
-                yticklabels=data_loader.label_encoder.classes_)
-    plt.title(f'Confusion Matrix - {data_name}')
-    plt.tight_layout() # Đảm bảo không bị mất chữ ở rìa
-    plt.savefig(os.path.join(res_dir, 'confusion_matrix.png'))
-    plt.close() # Đóng figure để giải phóng RAM
-
-    # --- Convergence Plot ---
-    plt.figure(figsize=(8,5))
-    plt.clf()
-    plt.plot(final_history, color='red', linewidth=1.5, label='Best Fitness')
-    plt.title(f'Convergence Plot - {data_name}')
-    plt.xlabel('Iteration')
-    plt.ylabel('Fitness Value')
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.legend()
-    plt.savefig(os.path.join(res_dir, 'convergence_plot.png'))
-    plt.close()
-
-    # --- Accuracy Comparison ---
-    plt.figure(figsize=(8,5))
-    plt.clf()
-    # Chuyển sang DataFrame để Seaborn vẽ chuẩn hơn và không bị nhầm lẫn dữ liệu cũ
-    df_acc = pd.DataFrame({
-        'Dataset': ['Dữ liệu Gốc', 'PA-5 Tối ưu'],
-        'Accuracy': [acc_full, acc_opt]
-    })
-    sns.barplot(data=df_acc, x='Dataset', y='Accuracy', palette='viridis')
-    plt.ylim(0, 1.1) # Cố định trục Y từ 0 đến 110% để dễ so sánh trực quan
-    plt.title(f'Accuracy Comparison - {data_name}')
-    # Ghi chú con số lên đầu cột
-    for i, val in enumerate([acc_full, acc_opt]):
-        plt.text(i, val + 0.02, f'{val*100:.2f}%', ha='center', fontweight='bold')
-    
-    plt.savefig(os.path.join(res_dir, 'accuracy_comparison.png'))
-    plt.close('all') # Đóng tất cả các figure đang tồn tại
-
-    print(f"[+] Hoàn thành {data_name}. Đã lưu đầy đủ hồ sơ kết quả.")
-    
 def main():
-    print("--- HỆ THỐNG TỐI ƯU HÓA CHỌN LỌC GENE PA-5 ---")
-    print("1. Chạy bộ Golub | 2. Chạy bộ CuMiDa | 3. Chạy tất cả")
-    c = input("Lựa chọn của bạn: ")
+    # Tạo thư mục kết quả
+    log_dir = os.path.join(config.BASE_DIR, "results")
+    os.makedirs(log_dir, exist_ok=True)
     
-    if c == '1':
-        run_experiment("Golub", config.DATASETS["Golub_Leukemia"])
-    elif c == '2':
-        run_experiment("CuMiDa", config.DATASETS["CuMiDa_GSE9476"])
-    elif c == '3':
-        for name, cfg in config.DATASETS.items():
-            run_experiment(name, cfg)
-    else:
-        print("Lựa chọn không hợp lệ.")
+    # Khởi tạo logger hệ thống
+    logger = DualLogger(os.path.join(log_dir, "EXECUTION_LOG.txt"))
+    sys.stdout = logger
+
+    try:
+        print(f"SESSION STARTED: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"SYSTEM CONFIG: Pop={config.POP_SIZE}, Iter={config.MAX_ITER}, Runs={config.R_RUNS}")
+
+        target_datasets = [
+            ("Golub", config.DATASETS["Golub_Leukemia"]),
+            ("CuMiDa", config.DATASETS["CuMiDa_GSE9476"])
+        ]
+        
+        algos_to_run = [config.ALGO_NAME, "GA", "PSO"] 
+
+        for data_name, data_cfg in target_datasets:
+            res_dir = os.path.join(config.BASE_DIR, "results", data_name)
+            os.makedirs(res_dir, exist_ok=True)
+            results_store = {}
+            
+            # Phase 1: Baseline Evaluation
+            base_res, c_names = run_experiment(data_name, data_cfg, "Baseline")
+            results_store['Baseline'] = base_res
+            
+            # Phase 2: Hybrid and Metaheuristic Optimization
+            for algo in algos_to_run:
+                res, _ = run_experiment(data_name, data_cfg, algo)
+                results_store[algo] = res
+
+            # Phase 3: Scientific Visualization
+            plot_combined_charts(results_store, data_name, res_dir)
+            plot_combined_confusion_matrices(results_store, data_name, res_dir, c_names)
+            
+        print("\nALL EXPERIMENTS COMPLETED SUCCESSFULLY.")
+
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR]: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Quan trọng: Luôn đóng logger để giải phóng file
+        logger.close()
 
 if __name__ == "__main__":
     main()
