@@ -378,3 +378,97 @@ def run_pso(X, y, fitness_func, **kwargs):
             break
             
     return GBestPos, GBestFit, history
+
+# --- STANDALONE RUNNERS (THÊM VÀO CUỐI FILE) ---
+# Các hàm này đóng vai trò như run_ga hay run_pso, quản lý vòng lặp chính
+
+def run_rbmo_standalone(X, y, fitness_func, **kwargs):
+    """Chạy thuật toán RBMO độc lập với 100% tài nguyên"""
+    dim = X.shape[1]
+    N = config.POP_SIZE # Dùng toàn bộ POP_SIZE (không chia đôi)
+    T, k = config.MAX_ITER, config.EXCHANGE_INTERVAL
+    
+    pop, fit = None, None
+    best_overall_f = np.inf
+    best_overall_z = None
+    fitness_history = []
+    
+    no_improve_count = 0
+    last_best_f = np.inf
+
+    for curr_it in range(0, T, k):
+        actual_k = min(k, T - curr_it)
+        if actual_k <= 0: break
+        
+        # Gọi hàm cốt lõi RBMO
+        f_best, x_best, pop, fit = RBMO(N, actual_k, dim, X, y, fitness_func, 
+                                        PopPos_in=pop, PopFit_in=fit,
+                                        global_iter_start=curr_it, global_max_iter=T, **kwargs)
+        
+        # Cập nhật kết quả tốt nhất
+        if f_best < best_overall_f:
+            best_overall_f = f_best
+            best_overall_z = x_best.copy()
+            
+        # Lưu lịch sử hội tụ
+        for _ in range(actual_k): fitness_history.append(best_overall_f)
+        
+        if config.PRINT_PROGRESS: 
+            print(f"> [RBMO-Only] Iter {curr_it + actual_k}/{T} | Best: {best_overall_f:.5f}")
+
+        # Kiểm tra dừng sớm (Early Stopping)
+        if best_overall_f < last_best_f:
+            last_best_f, no_improve_count = best_overall_f, 0
+        else:
+            no_improve_count += actual_k
+        
+        if no_improve_count >= config.PATIENCE:
+            remaining = T - len(fitness_history)
+            if remaining > 0: fitness_history.extend([best_overall_f] * remaining)
+            break
+            
+    return best_overall_z, best_overall_f, fitness_history
+
+def run_sboa_standalone(X, y, fitness_func, **kwargs):
+    """Chạy thuật toán SBOA độc lập với 100% tài nguyên"""
+    dim = X.shape[1]
+    N = config.POP_SIZE # Dùng toàn bộ POP_SIZE
+    T, k = config.MAX_ITER, config.EXCHANGE_INTERVAL
+    
+    pop, fit = None, None
+    best_overall_f = np.inf
+    best_overall_z = None
+    fitness_history = []
+    
+    no_improve_count = 0
+    last_best_f = np.inf
+
+    for curr_it in range(0, T, k):
+        actual_k = min(k, T - curr_it)
+        if actual_k <= 0: break
+        
+        # Gọi hàm cốt lõi SBOA
+        f_best, x_best, pop, fit = SBOA(N, actual_k, dim, X, y, fitness_func, 
+                                        PopPos_in=pop, PopFit_in=fit,
+                                        global_iter_start=curr_it, global_max_iter=T, **kwargs)
+        
+        if f_best < best_overall_f:
+            best_overall_f = f_best
+            best_overall_z = x_best.copy()
+            
+        for _ in range(actual_k): fitness_history.append(best_overall_f)
+        
+        if config.PRINT_PROGRESS: 
+            print(f"> [SBOA-Only] Iter {curr_it + actual_k}/{T} | Best: {best_overall_f:.5f}")
+
+        if best_overall_f < last_best_f:
+            last_best_f, no_improve_count = best_overall_f, 0
+        else:
+            no_improve_count += actual_k
+        
+        if no_improve_count >= config.PATIENCE:
+            remaining = T - len(fitness_history)
+            if remaining > 0: fitness_history.extend([best_overall_f] * remaining)
+            break
+            
+    return best_overall_z, best_overall_f, fitness_history
